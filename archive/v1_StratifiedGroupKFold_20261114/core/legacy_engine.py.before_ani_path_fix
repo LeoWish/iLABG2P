@@ -1,0 +1,826 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""iLAB-G2P: reproducible 256-strain, acid/bile, ANI-grouped 5-fold OOF.
+
+Run on AutoDL: /root/autodl-tmp/iLAB-G2P/.stage03_env/bin/python -u /root/autodl-tmp/iLAB-G2P/iLAB_G2P_256_OOF_AutoDL_OneClick.py
+Canonical output: ROOT/OOF_results
+No historical 247/255/257 OOF is ever imported as 256 predictions.
+The five language encoders require authentic embeddings; missing JEPA is skipped,
+never substituted. This is exploratory OOF, not an external validation set.
+"""
+from __future__ import annotations
+import os
+for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
+    os.environ[key]='1'
+os.environ['TOKENIZERS_PARALLELISM']='false'
+import argparse, csv, gzip, hashlib, importlib.util, itertools, json, math, re, shutil
+import subprocess, sys, tempfile, traceback, warnings
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import numpy as np
+    import pandas as pd
+    import sklearn
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.metrics import (roc_auc_score, average_precision_score, matthews_corrcoef,
+        balanced_accuracy_score, accuracy_score, precision_score, recall_score,
+        f1_score, confusion_matrix)
+    from sklearn.preprocessing import StandardScaler, Normalizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.ensemble import (RandomForestClassifier,ExtraTreesClassifier,
+        HistGradientBoostingClassifier,GradientBoostingClassifier)
+except ImportError as e:
+    raise SystemExit('Missing required Python dependencies (numpy,pandas,scikit-learn): '+str(e))
+
+VERSION='iLAB-G2P-256-OOF-v1.0-20261114'
+ROOT_DEFAULT='/root/autodl-tmp/iLAB-G2P'
+ENCODERS=('DNABERT-S','prokbert-mini','NTv2-100M','GENERanno-0.5B','JEPA-DNA-NTv3-100M')
+CLASSIFIERS=('LR_L2','LR_L1','SVM_RBF','RF','ExtraTrees','HistGB',
+             'GradientBoosting','XGBoost','LightGBM','CatBoost')
+MIDDLES=('concat_z','select128','block128_z','block128_l2','block256_z')
+EXTS=('.fasta.gz','.fna.gz','.fa.gz','.fas.gz','.fsa.gz','.fasta','.fna','.fa','.fas','.fsa')
+ID_TAILS=('_genomic','-genomic','_genome','-genome','_assembly','-assembly',
+          '_contigs','-contigs','_scaffolds','-scaffolds')
+PRED_COLS=['Cohort','Task','Route','Combination_ID','Upstream','Middle','Downstream',
+           'Fold','Strain_ID','Species','ANI_Group','Genome_SHA256','True_Label',
+           'Predicted_Score','Predicted_Label','Decision_Threshold','Correct','OOF_Protocol']
+METRIC_COLS=['Cohort','Task','Route','Combination_ID','Upstream','Middle','Downstream',
+             'Fold','N','Positive','Negative','ROC_AUC','PR_AUC','MCC','Balanced_Accuracy',
+             'Accuracy','Precision','Recall','F1','Specificity','TP','TN','FP','FN',
+             'Selection_Score','Effective_Dim','Feature_Weight_MiB','Status']
+SEED=20261114
+FEATURE_PROTOCOL_DIGEST='NOT_INITIALIZED'
+FEATURE_HASHES={}
+SOURCE_SHA256='NOT_INITIALIZED'
+
+
+def log(*args):
+    print('['+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+']',*args,flush=True)
+
+def sha(p):
+    h=hashlib.sha256()
+    with open(p,'rb') as f:
+        for b in iter(lambda:f.read(1<<20),b''):
+            h.update(b)
+    return h.hexdigest()
+
+def digest(x):
+    return hashlib.sha256(json.dumps(x,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+
+def atomic_json(p,data):
+    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
+    tmp=p.with_suffix(p.suffix+'.tmp')
+    tmp.write_text(json.dumps(data,indent=2,ensure_ascii=False,default=str,allow_nan=False),encoding='utf-8')
+    os.replace(tmp,p)
+
+def write_csv(p,rows,fields):
+    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
+    tmp=p.with_suffix(p.suffix+'.tmp')
+    with tmp.open('w',newline='',encoding='utf-8-sig') as f:
+        w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows)
+    os.replace(tmp,p)
+
+def norm(x):return re.sub('[^a-z0-9]','',str(x).lower())
+
+def fasta_stem(p):
+    name=p.name
+    for s in EXTS:
+        if name.lower().endswith(s):
+            name=name[:-len(s)];break
+    else:return None
+    while True:
+        orig=name
+        for s in ID_TAILS:
+            if name.lower().endswith(s):name=name[:-len(s)]
+        if name==orig:break
+    return name
+
+def valid_label(s):
+    v=str(s).strip()
+    if v in ('','?','nan','NaN','NA','None','null'):return None
+    if v in ('0','0.0'):return 0
+    if v in ('1','1.0'):return 1
+    raise ValueError('Label must be 0,1 or ?: '+repr(v))
+
+def audit_cohort(root,out):
+    csv_path=root/'data'/'data_256.csv';gdir=root/'data'/'genome'
+    if not csv_path.is_file():raise RuntimeError('MISSING canonical label file: '+str(csv_path))
+    if not gdir.is_dir():raise RuntimeError('MISSING genome directory: '+str(gdir))
+    with csv_path.open(newline='',encoding='utf-8-sig') as f:rows=list(csv.DictReader(f))
+    required=['Strain_ID','Species','Acid Resistant','Bile Resistant']
+    if len(rows)!=256:raise RuntimeError('Expected 256 CSV rows, got '+str(len(rows)))
+    if any(k not in rows[0] for k in required):raise RuntimeError('CSV columns must include '+str(required))
+    ids=[x['Strain_ID'].strip() for x in rows]
+    if len(set(ids))!=256 or not all(ids) or len(set(map(norm,ids)))!=256:
+        raise RuntimeError('Duplicate or empty Strain_ID')
+    if norm('Probio-M8') in set(map(norm,ids)) or 'M8' not in ids:
+        raise RuntimeError('Identity policy violation: delete Probio-M8 and keep M8')
+    files=[p for p in gdir.rglob('*') if p.is_file() and fasta_stem(p) is not None]
+    if len(files)!=256:
+        csv_norm={norm(i) for i in ids}
+        genome_norm={norm(fasta_stem(p)) for p in files}
+        only_genomes=sorted(fasta_stem(p) for p in files if norm(fasta_stem(p)) not in csv_norm)
+        only_csv=sorted(i for i in ids if norm(i) not in genome_norm)
+        raise RuntimeError(
+            f'COHORT_MISMATCH: data_256.csv has 256 rows but genome has {len(files)} FASTA files. '
+            f'Genome-only IDs: {only_genomes[:30]}; CSV-only IDs: {only_csv[:30]}. '
+            'Do not delete files automatically; reconcile the canonical 256 genomes first.'
+        )
+    byname=defaultdict(list)
+    for p in files:byname[norm(fasta_stem(p))].append(p)
+    missing=[i for i in ids if len(byname[norm(i)])!=1]
+    if missing:raise RuntimeError('FASTA identity 1:1 mismatch: '+repr(missing[:20]))
+    used=set();records=[]
+    for r in rows:
+        rid=r['Strain_ID'].strip();p=byname[norm(rid)][0]
+        if p in used:raise RuntimeError('FASTA reused by multiple IDs')
+        used.add(p)
+        records.append({'id':rid,'species':r['Species'].strip() or 'UNKNOWN',
+                        'acid':valid_label(r['Acid Resistant']),
+                        'bile':valid_label(r['Bile Resistant']),
+                        'fasta':str(p.resolve()),'genome_sha':sha(p),
+                        'genome_size':p.stat().st_size,'genome_mtime_ns':p.stat().st_mtime_ns})
+    if len(used)!=len(files):raise RuntimeError('Unmapped FASTA files')
+    namehash={}
+    for r in records:
+        if r['genome_sha'] in namehash:
+            log('[ALERT] Identical genome file content:',namehash[r['genome_sha']],r['id'])
+        namehash[r['genome_sha']]=r['id']
+    meta={'version':VERSION,'rows':256,'genomes':len(files),'label_csv':str(csv_path),
+          'label_csv_sha256':sha(csv_path),'acid':dict(Counter(str(r['acid']) for r in records)),
+          'bile':dict(Counter(str(r['bile']) for r in records)),
+          'cohort_digest':digest([(r['id'],r['species'],r['acid'],r['bile'],r['genome_sha']) for r in records]),
+          'genome_digest':digest([(r['id'],r['genome_sha']) for r in records]),
+          'id_policy':'M8 kept; Probio-M8 excluded','tag':'FROZEN_256'}
+    write_csv(out/'00_Cohort_256_Manifest.csv',records,list(records[0]))
+    atomic_json(out/'00_Cohort_256_Audit.json',meta)
+    log('[COHORT PASS] 256/256',meta['acid'],meta['bile'])
+    return records,meta
+
+class DSU:
+    def __init__(self,n):self.p=list(range(n))
+    def root(self,x):
+        while self.p[x]!=x:
+            self.p[x]=self.p[self.p[x]];x=self.p[x]
+        return x
+    def join(self,a,b):
+        a=self.root(a);b=self.root(b)
+        if a!=b:self.p[max(a,b)]=min(a,b)
+
+def ani_groups(records,out,args):
+    index={r['id']:i for i,r in enumerate(records)}
+    lookup={norm(r['id']):r['id'] for r in records}
+    for r in records:
+        p=Path(r['fasta'])
+        lookup[norm(str(p))]=r['id'];lookup[norm(p.name)]=r['id']
+        lookup[norm(fasta_stem(p))]=r['id']
+    uf=DSU(len(records));dup={}
+    for i,r in enumerate(records):
+        if r['genome_sha'] in dup:uf.join(i,dup[r['genome_sha']])
+        else:dup[r['genome_sha']]=i
+    path=out/'00_ANI995_skani_edges.tsv';method='skani_triangle_sparse_ANI_ge_99.5'
+    current_input=digest([(r['id'],r['genome_sha']) for r in records])
+    old_lock=out/'00_ANI_Input_Lock.json'
+    old_ani_lock=json.loads(old_lock.read_text()) if old_lock.exists() else {}
+    past_input=old_ani_lock.get('digest')
+    tampered=path.exists() and old_ani_lock.get('skani_result_sha256')!=sha(path)
+    if args.ani_groups:
+        z=pd.read_csv(args.ani_groups,dtype=str).fillna('')
+        idcol=next((x for x in z if norm(x) in ('strainid','strain','id')),None)
+        grcol=next((x for x in z if norm(x) in ('ani995group','anigroup','anicluster','groupid','cluster')),None)
+        if not idcol or not grcol or len(z)!=256 or z[idcol].duplicated().any():
+            raise RuntimeError('ANI group CSV must map exactly 256 unique Strain_ID to clusters')
+        groups=dict(zip(z[idcol],z[grcol]))
+        if set(groups)!=set(index) or not all(groups.values()):
+            raise RuntimeError('Missing IDs in ANI group CSV')
+        for i,r in enumerate(records):
+            if groups[r['id']]!=groups[records[uf.root(i)]['id']]:
+                raise RuntimeError('ANI grouping splits exact file-duplicates')
+        method='provided_ANI995_groups_NOT independently recomputed'
+        keys=[groups[r['id']] for r in records]
+    else:
+        if not path.exists() or args.recompute_ani or past_input!=current_input or tampered:
+            if not shutil.which('skani'):
+                if not args.allow_species_fallback:
+                    raise RuntimeError('skani not installed and no --ani-groups CSV. Refuse to label folds ANI-safe.')
+                log('[WARN] skani absent; using SPECIES CONSERVATIVE folds (NOT ANI995)')
+                keys=[r['species'] for r in records]
+                if any(x=='UNKNOWN' for x in keys):raise RuntimeError('Species fallback has UNKNOWN species')
+                method='SPECIES_CONSERVATIVE_NOT_ANI995'
+                return keys,method,{'group_count':len(set(keys)),'method':method,'skani_sha256':None}
+            gl=out/'00_Genome_List.txt';gl.write_text('\n'.join(r['fasta'] for r in records)+'\n')
+            cmd=['skani','triangle','-l',str(gl),'-o',str(path),'--sparse','-t',str(max(1,args.threads))]
+            log('[ANI]',' '.join(cmd));z=subprocess.run(cmd,text=True,capture_output=True)
+            (out/'00_Skani_Run.log').write_text(z.stdout+'\n'+z.stderr,encoding='utf-8')
+            if z.returncode!=0 or not path.exists():
+                raise RuntimeError('skani failed; see 00_Skani_Run.log')
+        # A sparse skani edge list is a standard TSV with ref,query,ANI (other columns optional).
+        with path.open(encoding='utf-8') as f:
+            rows=list(csv.reader(f,delimiter='\t'))
+        if not rows:raise RuntimeError('Empty skani ANI file')
+        h=[norm(x) for x in rows[0]]
+        if not any(x in h for x in ('ani','identity')):
+            raise RuntimeError('Unexpected skani edge list header: '+repr(rows[0]))
+        ai=next(i for i,x in enumerate(h) if x in ('ani','identity'))
+        ri=next((i for i,x in enumerate(h) if x.startswith('ref')),0)
+        qi=next((i for i,x in enumerate(h) if x.startswith('query')),1)
+        accepted=0;unmapped=[]
+        for row in rows[1:]:
+            if len(row)<=max(ai,ri,qi):continue
+            try:ani=float(row[ai])
+            except ValueError:continue
+            if ani<99.5:continue
+            a=lookup.get(norm(row[ri]));b=lookup.get(norm(row[qi]))
+            if not a or not b:
+                unmapped.append((row[ri],row[qi]));continue
+            uf.join(index[a],index[b]);accepted+=1
+        if unmapped:raise RuntimeError('ANI names not mapped: '+repr(unmapped[:4]))
+        keys=['ANI995_'+records[uf.root(i)]['id'] for i in range(len(records))]
+        atomic_json(old_lock,{'digest':current_input,'skani_result_sha256':sha(path)})
+        log('[ANI] >=99.5% edges:',accepted,'components',len(set(keys)))
+    # Never allow exact sequence-duplicates to land in separate groups.
+    for i,r in enumerate(records):
+        for j,q in enumerate(records[:i]):
+            if q['genome_sha']==r['genome_sha'] and keys[i]!=keys[j]:
+                raise RuntimeError('Identical genome assigned to two groups')
+    return keys,method,{'group_count':len(set(keys)),'method':method,
+                        'skani_sha256':sha(path) if path.exists() else None}
+
+def make_folds(records,groups,out,cohort,method,provenance):
+    folds={};allrows=[]
+    for task in ('acid','bile'):
+        inds=np.array([i for i,r in enumerate(records) if r[task] is not None],dtype=int)
+        yy=np.array([records[i][task] for i in inds],dtype=int)
+        gg=np.array([groups[i] for i in inds],dtype=str)
+        if min(Counter(yy).values())<5 or len(set(gg))<5:
+            raise RuntimeError('Not enough positive/negative labels or independent groups for '+task)
+        sg=StratifiedGroupKFold(n_splits=5,shuffle=True,random_state=SEED)
+        ff=[];seen=set()
+        for fold,(tr,te) in enumerate(sg.split(inds,yy,gg),1):
+            a=inds[tr];b=inds[te]
+            if len(set(gg[tr]) & set(gg[te])):raise RuntimeError('GROUP LEAKAGE')
+            if len(np.unique(yy[tr]))!=2 or len(np.unique(yy[te]))!=2:
+                raise RuntimeError('A validation fold has only one class: '+task+' fold '+str(fold))
+            if seen & set(b):raise RuntimeError('Repeated outer test index')
+            seen.update(b.tolist());ff.append((a,b))
+            for ix in b:
+                allrows.append({'Task':task,'Fold':fold,'Strain_ID':records[ix]['id'],
+                    'True_Label':records[ix][task],'ANI_Group':groups[ix],
+                    'Group_Protocol':method,'Cohort':cohort['cohort_digest']})
+        if seen!=set(inds.tolist()):raise RuntimeError('Incomplete OOF for '+task)
+        folds[task]=(inds,ff)
+    write_csv(out/'00_Frozen_ANI995_Folds.csv',allrows,list(allrows[0]))
+    info={'seed':SEED,'scheme':'5-fold StratifiedGroupKFold by task',
+        'ANI_method':method,'ANI':provenance,'cohort_digest':cohort['cohort_digest'],
+        'folds_sha256':sha(out/'00_Frozen_ANI995_Folds.csv'),
+        'independent_test_set':False}
+    atomic_json(out/'00_Fold_Provenance.json',info)
+    return folds,info
+
+
+def fasta_chunks(path):
+    op=gzip.open if str(path).lower().endswith('.gz') else open
+    with op(path,'rt',encoding='ascii',errors='replace') as f:
+        buff=[]
+        for line in f:
+            line=line.strip().upper()
+            if not line:continue
+            if line.startswith('>'):
+                if buff:yield ''.join(buff);buff=[]
+            else:buff.append(line)
+        if buff:yield ''.join(buff)
+
+def sampled_windows(path,nwindows,bp):
+    seq='N'.join(fasta_chunks(path))
+    if len(seq)<bp:yield seq;return
+    starts=np.linspace(0,len(seq)-bp,num=nwindows,dtype=np.int64)
+    for st in starts:yield seq[int(st):int(st)+bp]
+
+def window_kmer(window,k,bins):
+    """Orientation-invariant rolling hashed k-mers (specified, not exact count vectors)."""
+    b=np.frombuffer(window.encode('ascii','replace'),dtype=np.uint8)
+    lut=np.full(256,255,dtype=np.uint8)
+    for x,v in ((65,0),(67,1),(71,2),(84,3)):lut[x]=v
+    z=lut[b];n=len(z)-k+1
+    if n<=0:return np.zeros(bins,dtype=np.float32)
+    code=np.zeros(n,dtype=np.uint32);rc=np.zeros(n,dtype=np.uint32)
+    valid=np.ones(n,dtype=bool)
+    for j in range(k):
+        s=z[j:j+n];valid &= (s<4)
+        code=((code<<2)|(s.astype(np.uint32)&3))
+        rc |= ((3-(s.astype(np.uint32)&3))<<(2*j))
+    v=np.minimum(code[valid],rc[valid]).astype(np.uint64)
+    # Multiplicative avalanche mixes every nucleotide, not just low k-mer bits.
+    v^=v>>np.uint64(16);v*=np.uint64(0x7feb352d)
+    v^=v>>np.uint64(15);v*=np.uint64(0x846ca68b)
+    v^=v>>np.uint64(16)
+    counts=np.bincount(np.asarray(v % bins,dtype=np.int64),minlength=bins)
+    return counts.astype(np.float32)
+
+def kmer_features(records,out,args):
+    base=out/'cache'/'kmer';base.mkdir(parents=True,exist_ok=True)
+    mats={f'{k}mer':[] for k in range(4,11)}
+    for j,r in enumerate(records,1):
+        key=digest([r['genome_sha'],args.windows,args.window_bp,args.kmer_bins,'canonical_hashed_v1'])[:24]
+        p=base/(key+'.npz')
+        got=None
+        if p.exists():
+            try:
+                with np.load(p,allow_pickle=False) as z:
+                    if z['genome_sha'].item()==r['genome_sha'] and all(f'k{k}' in z for k in range(4,11)):
+                        got={f'{k}mer':z[f'k{k}'].astype(np.float32) for k in range(4,11)}
+            except Exception:got=None
+        if got is None:
+            counts={f'{k}mer':np.zeros(args.kmer_bins,dtype=np.float32) for k in range(4,11)}
+            for win in sampled_windows(r['fasta'],args.windows,args.window_bp):
+                for k in range(4,11):counts[f'{k}mer']+=window_kmer(win,k,args.kmer_bins)
+            # Normalize per k to frequency then log1p scaled for stability.
+            got={k:np.log1p(1000*v/max(1.0,float(v.sum()))).astype(np.float32)
+                 for k,v in counts.items()}
+            tmp=p.with_suffix('.tmp.npz')
+            np.savez_compressed(tmp,genome_sha=r['genome_sha'],**{f'k{k}':got[f'{k}mer'] for k in range(4,11)})
+            os.replace(tmp,p)
+        for k in mats:mats[k].append(got[k])
+        if j%32==0:log('[KMER]',j,'/256')
+    return {k:np.stack(v) for k,v in mats.items()}
+
+
+def load_npz_matrix(path,records):
+    with np.load(path,allow_pickle=False) as z:
+        ik=next((v for v in ('ids','strain_ids','Strain_ID') if v in z.files),None)
+        ek=next((v for v in ('embeddings','features','X') if v in z.files),None)
+        hk=next((v for v in ('genome_sha256','genome_hashes','genome_sha') if v in z.files),None)
+        if not ik or not ek or not hk:raise RuntimeError('NPZ requires ids, embeddings, genome_sha256')
+        ids=[str(x) for x in z[ik].tolist()];arr=np.asarray(z[ek],dtype=np.float32)
+        hs=[str(x) for x in z[hk].tolist()]
+        if len(ids)!=len(set(ids)) or arr.ndim!=2 or len(ids)!=len(hs) or arr.shape[0]!=len(ids):
+            raise RuntimeError('Malformed encoder NPZ')
+        ix={x:i for i,x in enumerate(ids)}
+        if any(r['id'] not in ix or hs[ix[r['id']]]!=r['genome_sha'] for r in records):
+            raise RuntimeError('Unmatched genome SHA256 or Strain_ID in encoder NPZ')
+        mat=arr[[ix[r['id']] for r in records]]
+        if not np.isfinite(mat).all():raise RuntimeError('Nonfinite embeddings')
+        return mat
+
+def legacy_per_strain_cache(name,records,roots,args):
+    tag=f'w{args.windows}_b{args.window_bp}_mean_last_v1'
+    files=[]
+    for rt in roots:
+        p=rt/'Stage03_CombinationSearch'/'cache'/'lm_embeddings'/name
+        if p.is_dir():files.extend(p.glob('*_'+tag+'.npz'))
+    found={}
+    for p in files:
+        try:
+            with np.load(p,allow_pickle=False) as z:
+                rid=str(z['id'].item());sig=str(z['signature'].item())
+                if rid in found:continue
+                found[rid]=(p,sig)
+        except Exception:continue
+    out=[]
+    for r in records:
+        if r['id'] not in found:return None
+        p,sig=found[r['id']]
+        expected=f'{r["genome_size"]}:{r["genome_mtime_ns"]}:{tag}'
+        if sig!=expected:return None
+        with np.load(p,allow_pickle=False) as z:out.append(np.asarray(z['embedding'],dtype=np.float32))
+    arr=np.stack(out)
+    return arr if arr.ndim==2 and np.isfinite(arr).all() else None
+
+def load_encoders(records,root,out,args):
+    supplied=out/'feature_input';supplied.mkdir(parents=True,exist_ok=True)
+    older=Path('/root/autodl-tmp/iLAB-G2P')
+    roots=[root]+([older] if older.exists() and older!=root else [])
+    outm={};availability={}
+    for name in ENCODERS:
+        errors=[];mat=None;origin=None
+        for rt in [supplied,root/'feature_cache']:
+            p=rt/(name+'.npz')
+            if p.exists():
+                try:mat=load_npz_matrix(p,records);origin=str(p);break
+                except Exception as e:errors.append(str(p)+': '+str(e))
+        if mat is None:
+            try:mat=legacy_per_strain_cache(name,records,roots,args);origin='validated_legacy_per_strain_npz'
+            except Exception as e:errors.append('legacy: '+str(e))
+        if mat is None and args.extract_encoders:
+            # Call the exact original official encoder implementation, if available.
+            script=next((rt/'stage03_combinatorial_search.py' for rt in roots
+                         if (rt/'stage03_combinatorial_search.py').exists()),None)
+            if script is not None:
+                try:
+                    spec=importlib.util.spec_from_file_location('stage03_base_256',str(script))
+                    mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+                    oldout=root/'Stage03_CombinationSearch';oldout.mkdir(exist_ok=True)
+                    rr=[{'id':r['id'],'fasta':r['fasta'],'species':r['species'],
+                         'acid':r['acid'],'bile':r['bile']} for r in records]
+                    # Official JEPA implementation is not interchangeable with HuggingFace AutoModel.
+                    candidate=mod.extract_lm(name,rr,root,oldout,args)
+                    if candidate is not None:
+                        mat=np.asarray(candidate,dtype=np.float32);origin='original_stage03_encoder_'+str(script)
+                except Exception as e:errors.append('official_extraction: '+repr(e))
+            else:errors.append('stage03_combinatorial_search.py not found')
+        if mat is not None and mat.ndim==2 and mat.shape[0]==256 and np.isfinite(mat).all():
+            outm[name]=np.ascontiguousarray(mat,dtype=np.float32)
+            availability[name]={'status':'READY','shape':list(mat.shape),'origin':origin}
+            log('[ENCODER READY]',name,mat.shape,origin)
+        else:
+            availability[name]={'status':'UNAVAILABLE','reasons':errors,
+                                'required':'authentic feature_input/<name>.npz with ids, embeddings, genome_sha256'}
+            log('[ENCODER MISSING]',name,errors[:1])
+    atomic_json(out/'00_Encoder_Availability.json',{'encoders':availability,'five_encoder_complete':len(outm)==5})
+    return outm,availability
+
+def transform(blocks,train,test,ytrain,method):
+    xparts=[];yparts=[]
+    # Each block is selected using TRAIN labels only, then normalized using TRAIN only.
+    for mat in blocks:
+        a=np.asarray(mat[train],dtype=np.float32);b=np.asarray(mat[test],dtype=np.float32)
+        yc=ytrain.astype(np.float32)-float(ytrain.mean())
+        mu=a.mean(axis=0,dtype=np.float64).astype(np.float32)
+        var=np.maximum(np.mean(a*a,axis=0)-mu*mu,0)
+        cov=yc @ a
+        strength=(cov*cov)/(np.maximum(var,1e-16)*max(float(yc@yc),1e-16))
+        strength[~np.isfinite(strength)]=0
+        nz=np.flatnonzero(var>1e-14)
+        if method=='concat_z':chosen=nz
+        else:
+            cnt=256 if method in ('block256_z','select128') else 128
+            if len(nz)>cnt:
+                ksel=np.argpartition(-strength[nz],cnt-1)[:cnt]
+                chosen=np.sort(nz[ksel])
+            else:chosen=nz
+        if not len(chosen):continue
+        aa=a[:,chosen];bb=b[:,chosen]
+        if method=='block128_l2':
+            n=Normalizer();aa=n.fit_transform(aa);bb=n.transform(bb)
+        else:
+            s=StandardScaler();aa=s.fit_transform(aa);bb=s.transform(bb)
+            aa=np.clip(aa,-10,10);bb=np.clip(bb,-10,10)
+        xparts.append(np.asarray(aa,dtype=np.float32));yparts.append(np.asarray(bb,dtype=np.float32))
+    if not xparts:raise RuntimeError('All feature blocks had zero variance on training fold')
+    X=np.concatenate(xparts,axis=1);Y=np.concatenate(yparts,axis=1)
+    if method=='select128' and X.shape[1]>128:
+        yc=np.asarray(ytrain,dtype=np.float32)-float(np.mean(ytrain))
+        strength=np.abs(yc @ X)
+        chosen=np.sort(np.argpartition(-strength,127)[:128])
+        X=X[:,chosen];Y=Y[:,chosen]
+    return X,Y
+
+def available_clfs():
+    ready=[];missing={}
+    for n in CLASSIFIERS:
+        try:
+            if n=='XGBoost':import xgboost
+            if n=='LightGBM':import lightgbm
+            if n=='CatBoost':import catboost
+            ready.append(n)
+        except ImportError as e:missing[n]=str(e)
+    return ready,missing
+
+def classifier(name):
+    if name=='LR_L2':return LogisticRegression(C=1,solver='liblinear',max_iter=1000,random_state=SEED)
+    if name=='LR_L1':return LogisticRegression(C=0.3,penalty='l1',solver='liblinear',max_iter=1000,random_state=SEED)
+    if name=='SVM_RBF':return SVC(C=1,kernel='rbf',probability=True,random_state=SEED,cache_size=300)
+    if name=='RF':return RandomForestClassifier(n_estimators=160,min_samples_leaf=2,n_jobs=1,random_state=SEED)
+    if name=='ExtraTrees':return ExtraTreesClassifier(n_estimators=160,min_samples_leaf=2,n_jobs=1,random_state=SEED)
+    if name=='HistGB':return HistGradientBoostingClassifier(max_iter=100,max_leaf_nodes=15,l2_regularization=1,random_state=SEED)
+    if name=='GradientBoosting':return GradientBoostingClassifier(n_estimators=100,max_depth=2,random_state=SEED)
+    if name=='XGBoost':
+        from xgboost import XGBClassifier
+        return XGBClassifier(n_estimators=120,max_depth=3,learning_rate=.06,subsample=.9,colsample_bytree=.9,
+                             eval_metric='logloss',n_jobs=1,random_state=SEED,tree_method='hist')
+    if name=='LightGBM':
+        from lightgbm import LGBMClassifier
+        return LGBMClassifier(n_estimators=120,num_leaves=9,learning_rate=.05,
+                    min_child_samples=10,n_jobs=1,verbosity=-1,random_state=SEED)
+    if name=='CatBoost':
+        from catboost import CatBoostClassifier
+        return CatBoostClassifier(iterations=120,depth=4,learning_rate=.06,loss_function='Logloss',
+                                   thread_count=1,verbose=False,random_seed=SEED)
+    raise KeyError(name)
+
+def metrics(y,proba,ypred):
+    y=np.asarray(y,dtype=int);p=np.asarray(proba,dtype=float);pred=np.asarray(ypred,dtype=int)
+    cm=confusion_matrix(y,pred,labels=[0,1]);tn,fp,fn,tp=map(int,cm.ravel())
+    roc=roc_auc_score(y,p) if len(np.unique(y))==2 else float('nan')
+    ap=average_precision_score(y,p) if len(np.unique(y))==2 else float('nan')
+    return {'N':len(y),'Positive':int(y.sum()),'Negative':int(len(y)-y.sum()),
+        'ROC_AUC':float(roc),'PR_AUC':float(ap),'MCC':float(matthews_corrcoef(y,pred)),
+        'Balanced_Accuracy':float(balanced_accuracy_score(y,pred)),
+        'Accuracy':float(accuracy_score(y,pred)),'Precision':float(precision_score(y,pred,zero_division=0)),
+        'Recall':float(recall_score(y,pred,zero_division=0)),
+        'F1':float(f1_score(y,pred,zero_division=0)),
+        'Specificity':float(tn/max(1,tn+fp)),'TP':tp,'TN':tn,'FP':fp,'FN':fn,
+        'Selection_Score':float(.6*ap+.4*matthews_corrcoef(y,pred)) if np.isfinite(ap) else float('nan')}
+
+def combo_meta(task,route,up,mid,clf,cohort,foldsha):
+    key={'v':VERSION,'cohort':cohort,'foldsha':foldsha,'task':task,'route':route,
+         'up':list(up),'mid':mid,'clf':clf,'sklearn':sklearn.__version__,
+         'feature_source_sha256':SOURCE_SHA256,
+         'feature_sha256':{name:FEATURE_HASHES[name] for name in up}}
+    cid=digest(key)[:20];return cid,key
+
+def evaluate(job,records,folds,features,groups,meta,out):
+    task,route,up,mid,clfname=job
+    cid,key=combo_meta(task,route,up,mid,clfname,meta['cohort_digest'],meta['folds_sha256'])
+    folder=out/'models'/task;folder.mkdir(parents=True,exist_ok=True)
+    path=folder/(cid+'.npz');info_path=folder/(cid+'.json')
+    if path.exists() and info_path.exists():
+        try:
+            old=json.loads(info_path.read_text())
+            if old.get('key')==key:
+                with np.load(path,allow_pickle=False) as z:
+                    if int(z['n'])==len(folds[task][0]) and len(z['score'])==int(z['n']) and np.all(np.isfinite(z['score'])):
+                        return {'status':'CACHED','id':cid,'task':task,'route':route,'up':up,'mid':mid,'clf':clfname,
+                                'path':str(path),'info':str(info_path)}
+        except Exception:pass
+    # Use fold-local transformations. NO calibration, feature selection or fitting on held-out rows.
+    idx,ff=folds[task]
+    score=np.full(len(records),np.nan,dtype=np.float64)
+    pred=np.full(len(records),-1,dtype=np.int8)
+    foldid=np.zeros(len(records),dtype=np.int8)
+    dimensions=[]
+    for k,(tr,te) in enumerate(ff,1):
+        ytr=np.array([records[i][task] for i in tr],dtype=int)
+        a,b=transform([features[x] for x in up],tr,te,ytr,mid)
+        model=classifier(clfname)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore',category=FutureWarning)
+            model.fit(a,ytr)
+        prob=model.predict_proba(b)[:,1]
+        if not np.all(np.isfinite(prob)):raise RuntimeError('Nonfinite test scores')
+        score[te]=prob;pred[te]=(prob>=.5).astype(np.int8);foldid[te]=k
+        dimensions.append(int(a.shape[1]))
+    if np.isnan(score[idx]).any() or np.any(foldid[idx]==0) or np.any(pred[idx]<0):
+        raise RuntimeError('Incomplete full five-fold predictions')
+    if int(np.isfinite(score).sum())!=len(idx):raise RuntimeError('Predictions leaked into unlabeled task rows')
+    temp=path.with_suffix('.tmp.npz')
+    np.savez_compressed(temp,score=score,pred=pred,fold=foldid,n=np.int64(len(idx)))
+    os.replace(temp,path)
+    info={'key':key,'upstream':'+'.join(up),'middle':mid,'classifier':clfname,
+          'effective_dim_max':max(dimensions),'effective_dim_mean':float(np.mean(dimensions)),
+          'fold_dims':dimensions,'cohort':'256','complete_five_fold_OOF':True}
+    atomic_json(info_path,info)
+    return {'status':'PASS','id':cid,'task':task,'route':route,'up':up,'mid':mid,'clf':clfname,
+            'path':str(path),'info':str(info_path)}
+
+def merge_verified_existing(completed,out,meta):
+    """Include previous VALID 256-model artifacts, never another cohort or code protocol."""
+    seen={x['id']:x for x in completed if x.get('status') in ('PASS','CACHED')}
+    for jp in (out/'models').glob('*/*.json'):
+        if jp.stem in seen:continue
+        try:
+            info=json.loads(jp.read_text(encoding='utf-8'));key=info.get('key',{})
+            if not info.get('complete_five_fold_OOF'):continue
+            if key.get('v')!=VERSION or key.get('cohort')!=meta['cohort_digest']:continue
+            if key.get('foldsha')!=meta['folds_sha256'] or key.get('feature_source_sha256')!=SOURCE_SHA256:continue
+            up=tuple(key['up'])
+            if any(u not in FEATURE_HASHES or key['feature_sha256'].get(u)!=FEATURE_HASHES[u] for u in up):continue
+            npz=jp.with_suffix('.npz')
+            if not npz.exists():continue
+            row={'status':'CACHED','id':jp.stem,'task':key['task'],'route':key['route'],
+                 'up':up,'mid':key['mid'],'clf':key['clf'],'path':str(npz),'info':str(jp)}
+            cid,_=combo_meta(row['task'],row['route'],up,row['mid'],row['clf'],
+                             meta['cohort_digest'],meta['folds_sha256'])
+            if cid==jp.stem:seen[cid]=row
+        except Exception:continue
+    return list(seen.values())
+
+def info_missing(av,missing):
+    return bool(missing) or any(av[n]['status']!='READY' for n in ENCODERS)
+
+def package_results(completed,records,folds,groups,meta,out,missing_clf,enc_availability,failures):
+    # Build ALL records from validated, current-version, frozen-fold model artifacts only.
+    unique={x['id']:x for x in completed if x.get('status') in ('PASS','CACHED')}
+    predpath=out/'01_All_Models_All_Folds_All_Strains_OOF.csv'
+    fold_rows=[];sum_rows=[];sample_stats=defaultdict(lambda:[0,0.0,0.0,0.0])
+    tmp=predpath.with_suffix('.csv.tmp')
+    with tmp.open('w',encoding='utf-8-sig',newline='') as f:
+        writer=csv.DictWriter(f,fieldnames=PRED_COLS);writer.writeheader()
+        for j,x in enumerate(sorted(unique.values(),key=lambda r:(r['task'],r['route'],r['id'])),1):
+            task=x['task'];idx,ff=folds[task];data=json.loads(Path(x['info']).read_text())
+            cid,key=combo_meta(task,x['route'],x['up'],x['mid'],x['clf'],meta['cohort_digest'],meta['folds_sha256'])
+            if cid!=x['id'] or data.get('key')!=key or not data.get('complete_five_fold_OOF'):
+                raise RuntimeError('Saved model checkpoint has invalid provenance')
+            with np.load(x['path'],allow_pickle=False) as z:
+                s=z['score'];p=z['pred'];fid=z['fold']
+            if len(s)!=256 or int(np.isfinite(s).sum())!=len(idx):
+                raise RuntimeError('Model must cover exactly all labeled samples')
+            # Never invent model checkpoint sizes; no on-disk weight inventory is supplied.
+            weights=None
+            common={'Cohort':'256','Task':task,'Route':x['route'],'Combination_ID':cid,
+                    'Upstream':'+'.join(x['up']),'Middle':x['mid'],'Downstream':x['clf'],
+                    'Effective_Dim':data['effective_dim_max'],'Feature_Weight_MiB':weights,'Status':'PASS'}
+            yy=np.array([records[i][task] for i in idx],dtype=int)
+            oof=metrics(yy,s[idx],p[idx])
+            sum_rows.append(dict(common,Fold='OOF_POOLED',**oof))
+            for k,(_,te) in enumerate(ff,1):
+                if any(fid[i]!=k for i in te):raise RuntimeError('Saved fold assignments mismatch')
+                yk=np.array([records[i][task] for i in te],dtype=int)
+                fold_rows.append(dict(common,Fold=k,**metrics(yk,s[te],p[te])))
+                for i in te:
+                    r=records[i];truth=r[task];prob=float(s[i]);prd=int(p[i])
+                    writer.writerow({'Cohort':'256','Task':task,'Route':x['route'],
+                        'Combination_ID':cid,'Upstream':'+'.join(x['up']),'Middle':x['mid'],
+                        'Downstream':x['clf'],'Fold':k,'Strain_ID':r['id'],
+                        'Species':r['species'],'ANI_Group':groups[i],
+                        'Genome_SHA256':r['genome_sha'],'True_Label':truth,
+                        'Predicted_Score':round(prob,9),'Predicted_Label':prd,
+                        'Decision_Threshold':.5,'Correct':int(prd==truth),
+                        'OOF_Protocol':meta['ANI_method']+'_GROUP5_EXPLORATORY'})
+                    stat=sample_stats[(task,r['id'])];stat[0]+=1;stat[1]+=int(prd==truth)
+                    stat[2]+=prob;stat[3]+=int(prd==1)
+            if j%100==0:log('[MERGE]',j,'/',len(unique))
+    os.replace(tmp,predpath)
+    write_csv(out/'02_Per_Fold_Metrics.csv',fold_rows,METRIC_COLS)
+    sum_rows.sort(key=lambda x:(x['Task'],x['Route'],-x['Selection_Score'],x['Combination_ID']))
+    write_csv(out/'03_Pooled_OOF_All_Metrics.csv',sum_rows,METRIC_COLS)
+    rankings=[]
+    for (task,route),g in itertools.groupby(sorted(sum_rows,key=lambda r:(r['Task'],r['Route'])),
+                                             key=lambda r:(r['Task'],r['Route'])):
+        group=list(g)
+        perf=sorted(group,key=lambda r:(-r['Selection_Score'],r['Effective_Dim']))
+        # Lightweight top5: near-Pareto with explicit ranking by weights+effective dims,
+        # not mislabeled as measured runtime or benchmark inference speed.
+        max_score=max(r['Selection_Score'] for r in group)
+        close=[r for r in group if r['Selection_Score']>=max_score-.05]
+        light=sorted(close,key=lambda r:(sum(u in ENCODERS for u in r['Upstream'].split('+')),
+                                           r['Effective_Dim'],-r['Selection_Score']))
+        for typ,rows in [('PERFORMANCE',perf[:5]),('LIGHTWEIGHT_PROXY_WITHIN_005',light[:5])]:
+            for rank,r in enumerate(rows,1):rankings.append(dict({'Ranking_Type':typ,'Rank':rank},**r))
+    write_csv(out/'04_Top5_Performance_and_Lightweight.csv',rankings,['Ranking_Type','Rank']+METRIC_COLS)
+    per_sample=[]
+    for (task,rid),stat in sorted(sample_stats.items()):
+        n,correct,score,pos=stat
+        per_sample.append({'Task':task,'Strain_ID':rid,'Combinations':n,
+                           'Correct_Rate':correct/n,'Mean_Predicted_Score':score/n,
+                           'Positive_Call_Rate':pos/n})
+    write_csv(out/'05_Each_Strain_Error_And_Agreement.csv',per_sample,
+              ['Task','Strain_ID','Combinations','Correct_Rate','Mean_Predicted_Score','Positive_Call_Rate'])
+    routecounts=dict(Counter((x['Task'],x['Route']) for x in sum_rows))
+    info={'version':VERSION,'cohort':256,'cohort_digest':meta['cohort_digest'],
+        'fold_sha256':meta['folds_sha256'],'ani_method':meta['ANI_method'],
+        'timestamp':datetime.now(timezone.utc).isoformat(),
+        'five_encoder_complete':all(enc_availability[n]['status']=='READY' for n in ENCODERS),
+        'encoders_available':[n for n in ENCODERS if enc_availability[n]['status']=='READY'],
+        'encoders_missing':[n for n in ENCODERS if enc_availability[n]['status']!='READY'],
+        'classifiers_missing':missing_clf,'failed_configurations':len(failures),
+        'model_count':len(sum_rows),
+        'per_fold_count':len(fold_rows),'oof_rows':sum(len(folds[x['Task']][0]) for x in sum_rows),
+        'route_counts':{str(k):v for k,v in routecounts.items()},
+        'completeness':'PARTIAL' if failures or info_missing(enc_availability,missing_clf) else 'COMPLETED_AVAILABLE_GRID',
+        'score':'0.6*PR_AUC+0.4*MCC; ROC-AUC NOT used for ranking',
+        'caveats':['Internal 5-fold OOF; not independent external validation',
+                   'Selected Top5 from the same OOF: optimistic model-selection bias',
+                   'k-mer is canonical hashed and sampled, not exact genome-wide 4^k exhaustive enumeration',
+                   'Lightweight ranking uses pretrained-encoder count and feature dimension; weight sizes are unknown',
+                   'No old-cohort OOF predictions imported']}
+    atomic_json(out/'99_New_256_Run_Summary.json',info)
+    readme=(f'# iLAB-G2P | 256-strain OOF Results\n\n'
+            f'- STATUS: {"COMPLETE" if len(sum_rows)>0 and not info["encoders_missing"] and not missing_clf and not failures else "PARTIAL — inspect availability and failures"}\n'
+            f'- 256 matched genomes; cohort digest `{meta["cohort_digest"]}`\n'
+            f'- ANI scheme `{meta["ANI_method"]}`\n'
+            f'- models with complete 5-fold OOF: {len(sum_rows)}\n'
+            f'- rows of per-strain per-combination OOF: {info["oof_rows"]}\n'
+            f'- Available encoders: {", ".join(info["encoders_available"])}\n'
+            f'- Missing encoders: {", ".join(info["encoders_missing"])}\n'
+            f'- Failed configurations: {len(failures)}\n\n'
+            '## Contents\n'
+            '- `00_Cohort_256_Manifest.csv`: strict strain↔genome provenance\n'
+            '- `00_Frozen_ANI995_Folds.csv`: exact labeled fold membership\n'
+            '- `01_All_Models_All_Folds_All_Strains_OOF.csv`: one record per fold×strain×combination\n'
+            '- `02_Per_Fold_Metrics.csv`: complete per-fold metrics\n'
+            '- `03_Pooled_OOF_All_Metrics.csv`: pooled OOF metrics for each model\n'
+            '- `04_Top5_Performance_and_Lightweight.csv`: route/task-specific Top5\n'
+            '- `05_Each_Strain_Error_And_Agreement.csv`: strain-level error and disagreement\n'
+            '- `models/`: immutable individual model OOF checkpoints with provenance\n'
+            '- `99_New_256_Run_Summary.json`: audit/status\n\n'
+            'Caution: Models selected and evaluated on the same OOF are exploratory, not an unbiased external test.\n')
+    (out/'README_256_OOF.md').write_text(readme,encoding='utf-8')
+    log('[NEW SUMMARY] models',len(sum_rows),'OOF prediction rows',info['oof_rows'])
+    for task in ('acid','bile'):
+        for route in ('A_ENCODER','B_KMER','C_CROSS'):
+            group=[r for r in sum_rows if r['Task']==task and r['Route']==route]
+            if group:
+                r=max(group,key=lambda z:z['Selection_Score'])
+                log('[TOP1]',task,route,round(r['Selection_Score'],5),r['Upstream'],r['Middle'],
+                    r['Downstream'],'AP',round(r['PR_AUC'],4),'MCC',round(r['MCC'],4))
+            else:log('[MISSING]',task,route,'no valid fully verified full-OOF models')
+    return sum_rows
+
+
+def build_plan(lm,kmer,mode):
+    a=[];b=[]
+    if mode!='kmer':
+        names=list(lm)
+        # Up to 3-way interactions plus the full five encoders if available.
+        for n in range(1,min(3,len(names))+1):a+=list(itertools.combinations(names,n))
+        if len(names)>=4:a.append(tuple(names))
+    if mode!='encoder':
+        singles=[(f'{k}mer',) for k in range(4,11)]
+        pairs=list(itertools.combinations([f'{k}mer' for k in range(4,11)],2))
+        triples=[tuple(f'{k+j}mer' for j in range(3)) for k in range(4,9)]
+        b=singles+pairs+triples+[tuple(f'{k}mer' for k in range(4,11))]
+    return list(dict.fromkeys(a)),list(dict.fromkeys(b))
+
+def run_jobs(jobs,records,folds,features,groups,meta,out,args,results,failures):
+    if not jobs:return
+    log('[START]',len(jobs),'configurations; complete FULL5 OOF')
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futs={pool.submit(evaluate,j,records,folds,features,groups,meta,out):j for j in jobs}
+        for n,fut in enumerate(as_completed(futs),1):
+            try:results.append(fut.result())
+            except Exception as e:
+                job=futs[fut];failures.append({'job':str(job),'reason':repr(e),
+                                               'traceback':traceback.format_exc(limit=5)})
+                if len(failures)<=6:log('[MODEL FAILED]',job,repr(e)[:250])
+            if n%50==0 or n==len(jobs):
+                log('[PROGRESS]',n,'/',len(jobs),'pass',len(results),'fail',len(failures))
+                write_csv(out/'99_Model_Failures.csv',failures,['job','reason','traceback'])
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--root',default=ROOT_DEFAULT)
+    ap.add_argument('--mode',choices=('full','kmer','encoder','audit','quick'),default='full')
+    ap.add_argument('--threads',type=int,default=8,help='skani CPU threads')
+    ap.add_argument('--workers',type=int,default=2,help='Concurrent model configurations (start with 2)')
+    ap.add_argument('--windows',type=int,default=16)
+    ap.add_argument('--window-bp',type=int,default=1024)
+    ap.add_argument('--kmer-bins',type=int,default=4096)
+    ap.add_argument('--ani-groups',default='',help='Externally validated 256-ID ANI cluster CSV')
+    ap.add_argument('--recompute-ani',action='store_true')
+    ap.add_argument('--allow-species-fallback',action='store_true',help='NOT ANI 99.5%%; exploratory only')
+    ap.add_argument('--extract-encoders',action='store_true',default=True)
+    ap.add_argument('--no-extract-encoders',dest='extract_encoders',action='store_false')
+    ap.add_argument('--quick-combos',type=int,default=2,help='Per route for smoke sanity')
+    args=ap.parse_args()
+    root=Path(args.root).resolve();out=root/'OOF_results';out.mkdir(parents=True,exist_ok=True)
+    try:
+        import fcntl
+        lock=open(out/'.256_oof.lock','a+')
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise RuntimeError('Already running an OOF experiment on this output dir')
+        if args.workers<1 or args.kmer_bins<256:raise RuntimeError('Invalid worker or k-mer dimensions')
+        records,cohort=audit_cohort(root,out)
+        groups,method,prov=ani_groups(records,out,args)
+        folds,fold_meta=make_folds(records,groups,out,cohort,method,prov)
+        meta=dict(cohort,**fold_meta)
+        if args.mode=='audit':
+            log('[AUDIT ONLY] No models trained, frozen folds ready');return
+        ready,missing=available_clfs()
+        if missing:log('[WARNING] Missing classifiers; these will be excluded:',missing)
+        km=kmer_features(records,out,args) if args.mode!='encoder' else {}
+        lm,av=load_encoders(records,root,out,args) if args.mode!='kmer' else ({},{n:{'status':'NOT_REQUESTED'} for n in ENCODERS})
+        features=dict(km,**lm)
+        global FEATURE_PROTOCOL_DIGEST
+        global SOURCE_SHA256,FEATURE_HASHES
+        SOURCE_SHA256=sha(Path(__file__))
+        FEATURE_HASHES={k:hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()
+                        for k,v in sorted(features.items())}
+        FEATURE_PROTOCOL_DIGEST=digest({'source_sha256':SOURCE_SHA256,'features':FEATURE_HASHES})
+        A,B=build_plan(lm,km,args.mode)
+        if args.mode=='quick':A=A[:args.quick_combos];B=B[:args.quick_combos]
+        atomic_json(out/'00_Protocol.json',{'version':VERSION,'config':vars(args),'encoders':list(lm),
+            'classifier_configs':ready,'fusion_methods':MIDDLES,'A_upstreams':len(A),
+            'B_upstreams':len(B),'ANI_method':method,
+            'validation':'Each model is trained from scratch in 5 group-disjoint outer folds',
+            'feature_transform':'TRAIN-only correlation selection, train-only scaler or normalizer',
+            'threshold':.5,'score':'0.6*PR_AUC+0.4*MCC','kmer_sketch':'canonical hashed; 16x1024bp sampled windows by default',
+            'external_test':False,'feature_protocol_digest':FEATURE_PROTOCOL_DIGEST})
+        results=[];failures=[];mid=MIDDLES if args.mode!='quick' else ('block128_z',)
+        clfs=ready if args.mode!='quick' else ready[:2]
+        for task in ('acid','bile'):
+            jobs=[(task,'A_ENCODER',up,m,c) for up in A for m in mid for c in clfs]
+            jobs +=[(task,'B_KMER',up,m,c) for up in B for m in mid for c in clfs]
+            run_jobs(jobs,records,folds,features,groups,meta,out,args,results,failures)
+        # Cross-route Top5 candidates from their respective SAME-COHORT completed OOF files.
+        if A and B and args.mode not in ('quick','encoder','kmer'):
+            provisional=[]
+            for x in results:
+                try:
+                    idx,_=folds[x['task']]
+                    with np.load(x['path'],allow_pickle=False) as z:
+                        p=z['score'];q=z['pred']
+                    y=np.array([records[i][x['task']] for i in idx],dtype=int)
+                    z=metrics(y,p[idx],q[idx]);provisional.append(dict(x,**z))
+                except Exception as e:failures.append({'job':'RANK '+str(x.get('id')),'reason':repr(e),'traceback':''})
+            for task in ('acid','bile'):
+                left=sorted([x for x in provisional if x['task']==task and x['route']=='A_ENCODER'],
+                            key=lambda x:-x['Selection_Score'])[:5]
+                right=sorted([x for x in provisional if x['task']==task and x['route']=='B_KMER'],
+                             key=lambda x:-x['Selection_Score'])[:5]
+                cross=list(dict.fromkeys(tuple(dict.fromkeys(a['up']+b['up'])) for a in left for b in right))
+                jobs=[(task,'C_CROSS',up,m,c) for up in cross for m in ('block128_z','block256_z') for c in ready]
+                run_jobs(jobs,records,folds,features,groups,meta,out,args,results,failures)
+        write_csv(out/'99_Model_Failures.csv',failures,['job','reason','traceback'])
+        results=merge_verified_existing(results,out,meta)
+        package_results(results,records,folds,groups,meta,out,missing,av,failures)
+        log('[FINISHED] New 256 OOF archive:',out,'failed configs:',len(failures))
+    except Exception:
+        (out/'99_FATAL_ERROR.txt').write_text(traceback.format_exc(),encoding='utf-8')
+        log('[FATAL]',traceback.format_exc());raise
+
+if __name__=='__main__':main()

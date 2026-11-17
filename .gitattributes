@@ -1,0 +1,7 @@
+/Supplementary_Material/Data_S3_Acid_RouteA_encoder_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S4_Acid_RouteB_kmer_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S5_Acid_RouteC_cross_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S6_Bile_RouteA_encoder_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S7_Bile_RouteB_kmer_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S8_Bile_RouteC_cross_OOF_predictions.csv filter=lfs diff=lfs merge=lfs -text
+/Supplementary_Material/Data_S9_All_models_per_fold_metrics_and_confusion.csv filter=lfs diff=lfs merge=lfs -text

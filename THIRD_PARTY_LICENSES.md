@@ -1,0 +1,3 @@
+# Encoder licensing and upstream provenance
+
+Five encoder directories are populated from a previously validated AutoDL local research workspace. Their model weights, architecture code, tokenizer, and related files are third-party material and may have individual licenses and gated access. The `JEPA-DNA-NTv3-100M` target checkpoint includes the **NVIDIA non-commercial license** in its upstream model description. Do not redistribute any pretrained weights, tokenizer, or copied source without verifying the applicable license and attribution. Keep `encodemodels/**/provenance` and upstream LICENSE/README files. This repository does not grant rights to third-party materials.

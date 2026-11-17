@@ -1,0 +1,8 @@
+{
+  "method": "full labeled-cohort refit after verified historical five-fold OOF selection",
+  "source_manifest_sha256": "e30d9d56b3eafba11511628c5b00c44ddd93a34743c9dd53e2282f9a5abb5d3e",
+  "source_metrics_sha256": "fe77d91ac0e7d586ecaab5e66879b9645182d3c7e4c7f81eaa22c2d188ef306b",
+  "cohort_digest": "1120f3d9e17afb42c054d6c287f023ea7ad8d6476e7174b5eb42411e19001138",
+  "models_per_task": 10,
+  "historical_OOF_only_not_external_validation": true
+}

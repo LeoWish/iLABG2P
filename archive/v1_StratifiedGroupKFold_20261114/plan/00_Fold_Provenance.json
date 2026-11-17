@@ -1,0 +1,13 @@
+{
+  "seed": 20261114,
+  "scheme": "5-fold StratifiedGroupKFold by task",
+  "ANI_method": "skani_triangle_sparse_ANI_ge_99.5",
+  "ANI": {
+    "group_count": 89,
+    "method": "skani_triangle_sparse_ANI_ge_99.5",
+    "skani_sha256": "26f7a80a8c129e8997799f9adbe4e95a939c2d488677b64d642c57206f4e1528"
+  },
+  "cohort_digest": "1120f3d9e17afb42c054d6c287f023ea7ad8d6476e7174b5eb42411e19001138",
+  "folds_sha256": "564c700937ebe60dfcff70b8a6bfba861bb61f2ed391bbd721d1cafa184acf04",
+  "independent_test_set": false
+}

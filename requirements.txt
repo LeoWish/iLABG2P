@@ -1,0 +1,10 @@
+# iLAB-G2P v2 (Python >= 3.10; versions of the original fitted-model environment are pinned in requirements_portable_lock.txt)
+numpy
+scipy>=1.9          # scipy.optimize.milp (HiGHS) for the balanced ANI-group folds
+pandas
+scikit-learn
+joblib
+xgboost
+lightgbm
+catboost
+openpyxl            # Supplementary_Tables_*.xlsx export

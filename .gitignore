@@ -1,0 +1,25 @@
+# Only GitHub-safe source; real data, model artifacts and embeddings are shared in separately licensed releases
+/data/data_256.csv
+/data/genome/**
+/encodemodels/**/model/**
+/encodemodels/**/features/*.npz
+/encodemodels/**/source/**
+/encodemodels/**/provenance/**
+/cacher/**
+/save_models/**
+/results/**
+/plan/*.csv
+/plan/*.json
+/test_data/*.fa
+/test_data/*.fna
+/test_data/*.fasta
+/test_data/*.gz
+/test_data/embeddings/**
+/examples/DEMO_Predictions.csv
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.part
+.DS_Store

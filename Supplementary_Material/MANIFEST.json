@@ -1,0 +1,104 @@
+{
+  "cohort_genomes": 256,
+  "model_configurations": 16780,
+  "oof_prediction_rows": 3310500,
+  "cv_scheme": "BalancedANI995_MILP_v2",
+  "folds_sha256": "aad2d123f916e32e32ba54730954d533f834b2828dc0a312e606e6e52a0c22d6",
+  "pipeline_version": "iLAB-G2P-256-OOF-v2.0-BalancedANI-20261116",
+  "smoke_test": false,
+  "files": [
+    {
+      "file": "Data_S10_Extra_RouteC_exploration_not_in_grid.csv",
+      "rows": 800,
+      "size_bytes": 258689,
+      "sha256": "1645b8e5bd4f51928e7593827d0efcdf3238eb3e3e049feea8911ba5851fc769"
+    },
+    {
+      "file": "Data_S1_Acid_all_8280_models_OOF_performance.csv",
+      "rows": 8280,
+      "size_bytes": 2139024,
+      "sha256": "ca3cb37b3fdd3dca8a87025b59a354bf6efc4772103ba4c4cbad8f491f3fc699"
+    },
+    {
+      "file": "Data_S2_Bile_all_8500_models_OOF_performance.csv",
+      "rows": 8500,
+      "size_bytes": 2193723,
+      "sha256": "e1b19e7cc1a00a9523fa9d502894a815b3e9fbdf3c67c0e809ac1ea972185b28"
+    },
+    {
+      "file": "Data_S3_Acid_RouteA_encoder_OOF_predictions.csv",
+      "rows": 271250,
+      "size_bytes": 75488239,
+      "sha256": "96e377370d2044b7abd0abae843f7dd0b55c855d79f6ebc0dd05b109de1629e9"
+    },
+    {
+      "file": "Data_S4_Acid_RouteB_kmer_OOF_predictions.csv",
+      "rows": 1111250,
+      "size_bytes": 287093164,
+      "sha256": "28bcf6b0a6218f797b1edb945f0bd99bd4e4f698d30555d98f3198dfa32023e6"
+    },
+    {
+      "file": "Data_S5_Acid_RouteC_cross_OOF_predictions.csv",
+      "rows": 66500,
+      "size_bytes": 18627954,
+      "sha256": "0fbd4627931975300ceda0cafeca69ed302ef41237461566a0a714508177bceb"
+    },
+    {
+      "file": "Data_S6_Bile_RouteA_encoder_OOF_predictions.csv",
+      "rows": 339450,
+      "size_bytes": 94509373,
+      "sha256": "8d49c34205983100d7f26754f50a21790dcb7ca9aea473b627a79f2a5deb718b"
+    },
+    {
+      "file": "Data_S7_Bile_RouteB_kmer_OOF_predictions.csv",
+      "rows": 1390650,
+      "size_bytes": 359430782,
+      "sha256": "f99b1a75c93df97ecd4ccfd123b5b2fd771295b1fc4be4be8c5703c19187ff77"
+    },
+    {
+      "file": "Data_S8_Bile_RouteC_cross_OOF_predictions.csv",
+      "rows": 131400,
+      "size_bytes": 37850805,
+      "sha256": "96a24235f1de8ecd4ca0225eadb55135a06eab557786f30dff95532a89c34415"
+    },
+    {
+      "file": "Data_S9_All_models_per_fold_metrics_and_confusion.csv",
+      "rows": 83900,
+      "size_bytes": 22158987,
+      "sha256": "3cbcb9636ce855a3e0d2e1b4d78ca2d4585c6ead2c6a319b08da85497d4f437c"
+    },
+    {
+      "file": "README.md",
+      "rows": null,
+      "size_bytes": 8398,
+      "sha256": "64a5e6956e2ff2e76699fb62dfee67bcb4b18c893fbe8f606937b9969bf508f7"
+    },
+    {
+      "file": "Supplementary_Tables_S1-S20.xlsx",
+      "rows": {
+        "Table_S1_Cohort": 256,
+        "Table_S2_Top100_models": 200,
+        "Table_S3_Component_summary": 84,
+        "Table_S4_Taxonomy_check": 22,
+        "Table_S5_Top1_by_species": 21,
+        "Table_S6_Pangenome_summary": 16,
+        "Table_S7_Population_structure": 30,
+        "Table_S8_Profiles_CMH": 1088,
+        "Table_S9_Candidate_modules": 27,
+        "Table_S10_Top5_evidence": 10,
+        "Table_S11_Top5_members": 68,
+        "Table_S12_CMH_sensitivity": 211,
+        "Table_S13_Enriched_terms": 26,
+        "Table_S14_Direction_enrichment": 22,
+        "Table_S15_CV_fold_design": 20,
+        "Table_S16_Top10_per_fold": 100,
+        "Table_S17_Fold_scheme_change": 32,
+        "Table_S18_Top10_rank_change": 40,
+        "Table_S19_Split_stability": 40,
+        "Table_S20_Ranking_agreement": 2
+      },
+      "size_bytes": 358784,
+      "sha256": "a4bac00371aedbb3205d92a6d0fd8cdc6eaff29ce674bc59677236c9cc18f0df"
+    }
+  ]
+}
